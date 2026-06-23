@@ -30,7 +30,11 @@ Edit [`config.yaml`](config.yaml) to set:
 
 ## Usage
 
-Full pipeline (sample → perturb → evaluate → metrics → figures):
+Full pipeline:
+
+```
+load → warm paraphrase cache → perturb (fan-out) → evaluate (unified loop) → metrics → viz
+```
 
 ```bash
 python run.py
@@ -45,7 +49,7 @@ python run.py --sample-size 10 --conditions original,context_inject --models mod
 # Composed perturbation stack
 python run.py --conditions context_inject+instruction_style:verbose
 
-# Resume after crash (evaluation checkpoints per model × condition)
+# Resume after crash (question-level checkpoint; no re-querying completed work)
 python run.py --sample-size 300
 
 # Re-sample MMLU questions
@@ -80,9 +84,9 @@ python run.py --skip-viz
 |------|----------|
 | `data/sampled.jsonl` | Stratified MMLU sample |
 | `data/perturbed/*.jsonl` | One file per perturbation condition |
-| `data/cache/paraphrase/` | SHA-256 keyed paraphrase cache |
-| `results/raw/*.jsonl` | Per-question eval records |
-| `results/raw/checkpoints/` | Resume checkpoints |
+| `data/cache/paraphrase/` | SHA-256 keyed paraphrase cache (warmed before perturb/eval) |
+| `results/raw/results.jsonl` | All eval records (append-only) |
+| `results/raw/checkpoints/eval_checkpoint.json` | Question-level resume checkpoint |
 | `results/metrics/summary.csv` | Flat metrics table |
 | `results/metrics/metrics.json` | Full metrics dict |
 | `results/metrics/run_meta.json` | Seed, models, conditions, timestamp |
@@ -101,9 +105,10 @@ python run.py --skip-viz
 config.yaml
 run.py
 src/
-  loader.py        # MMLU loading and stratified sampling
-  perturbations.py # Perturbation transforms and cache
-  evaluator.py     # Model querying and response parsing
+  loader.py          # MMLU loading and stratified sampling
+  paraphrase_cache.py # Upfront paraphrase generation and disk cache
+  perturbations.py   # Independent perturbation pipelines
+  evaluator.py       # Unified eval loop and question-level checkpoint
   metrics.py       # Metric computation
   viz.py           # Matplotlib figures
   conditions.py    # Condition parsing (including composed stacks)

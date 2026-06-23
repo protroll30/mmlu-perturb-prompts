@@ -167,6 +167,9 @@ def iter_raw_result_files(raw_dir: str | Path) -> list[Path]:
     root = Path(raw_dir)
     if not root.exists():
         return []
+    unified = root / "results.jsonl"
+    if unified.exists():
+        return [unified]
     return sorted(p for p in root.glob("*.jsonl") if p.is_file())
 
 

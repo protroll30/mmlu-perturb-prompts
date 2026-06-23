@@ -19,6 +19,9 @@ from src.types import EvalRecord, ModelConfig, PerturbedQuestion
 
 logger = logging.getLogger(__name__)
 
+RESULTS_FILENAME = "results.jsonl"
+CHECKPOINT_FILENAME = "eval_checkpoint.json"
+
 INSTRUCTION_PREFIXES = {
     "none": "",
     "minimal": "",
@@ -33,6 +36,14 @@ ANSWER_SUFFIXES = {
     "minimal": "Answer:",
     "verbose": "Answer:",
 }
+
+
+@dataclass(frozen=True)
+class EvalTask:
+    model_id: str
+    condition_id: str
+    question_id: str
+    question: PerturbedQuestion
 
 
 @dataclass(frozen=True)
@@ -164,78 +175,134 @@ def parse_answer(response: str, label_style: str = "alpha_upper") -> int | None:
     return None
 
 
-def _checkpoint_path(checkpoint_dir: Path, model_id: str, condition_id: str) -> Path:
-    safe_condition = condition_id.replace("/", "_")
-    return checkpoint_dir / f"{model_id}__{safe_condition}.json"
+def checkpoint_key(model_id: str, condition_id: str, question_id: str) -> str:
+    return f"{model_id}|{condition_id}|{question_id}"
 
 
-def _results_path(raw_dir: Path, model_id: str, condition_id: str) -> Path:
-    safe_condition = condition_id.replace("/", "_")
-    return raw_dir / f"{model_id}__{safe_condition}.jsonl"
+def _results_path(raw_dir: Path) -> Path:
+    return raw_dir / RESULTS_FILENAME
+
+
+def _checkpoint_path(raw_dir: Path) -> Path:
+    return raw_dir / "checkpoints" / CHECKPOINT_FILENAME
 
 
 def _load_checkpoint(path: Path) -> set[str]:
     if not path.exists():
         return set()
     data = read_json(path)
-    return set(data.get("completed_ids", []))
+    return set(data.get("completed_keys", []))
 
 
-def _save_checkpoint(path: Path, completed_ids: set[str], seed: int) -> None:
+def _save_checkpoint(path: Path, completed_keys: set[str], seed: int) -> None:
     atomic_write_json(
         path,
         {
-            "completed_ids": sorted(completed_ids),
+            "completed_keys": sorted(completed_keys),
             "seed": seed,
         },
     )
 
 
-def evaluate(
-    client: ModelClient,
-    condition_path: Path,
+def _build_eval_queue(
+    models: list[ModelConfig],
+    perturbed_paths: dict[str, Path],
+) -> list[EvalTask]:
+    questions_by_condition: dict[str, dict[str, PerturbedQuestion]] = {}
+    for condition_id, path in perturbed_paths.items():
+        questions = load_perturbed_questions(path)
+        questions_by_condition[condition_id] = {
+            q.original_id: q for q in questions
+        }
+
+    question_ids = sorted(
+        {
+            qid
+            for by_qid in questions_by_condition.values()
+            for qid in by_qid
+        }
+    )
+    condition_ids = sorted(perturbed_paths.keys())
+    model_ids = [m.id for m in models]
+
+    tasks: list[EvalTask] = []
+    for question_id in question_ids:
+        for condition_id in condition_ids:
+            question = questions_by_condition[condition_id].get(question_id)
+            if question is None:
+                continue
+            for model in models:
+                tasks.append(
+                    EvalTask(
+                        model_id=model.id,
+                        condition_id=condition_id,
+                        question_id=question_id,
+                        question=question,
+                    )
+                )
+    return tasks
+
+
+def run_evaluation(
+    models: list[ModelConfig],
+    perturbed_paths: dict[str, Path],
     raw_results_dir: Path,
-    checkpoint_dir: Path,
     seed: int,
 ) -> Path:
-    questions = load_perturbed_questions(condition_path)
-    if not questions:
-        raise ValueError(f"No questions found in {condition_path}")
-
-    condition_id = questions[0].condition_id
-    checkpoint_path = _checkpoint_path(checkpoint_dir, client.model_id, condition_id)
-    results_path = _results_path(raw_results_dir, client.model_id, condition_id)
-
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    """Single evaluation loop: question → condition → model, with question-level checkpoint."""
     raw_results_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_path = _checkpoint_path(raw_results_dir)
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    results_path = _results_path(raw_results_dir)
 
+    clients = {m.id: build_model_client(m) for m in models}
     completed = _load_checkpoint(checkpoint_path)
+    queue = _build_eval_queue(models, perturbed_paths)
 
-    for question in questions:
-        if question.original_id in completed:
+    total = len(queue)
+    done_before = len(completed)
+    logger.info(
+        "Evaluation queue: %s tasks (%s already checkpointed)",
+        total,
+        done_before,
+    )
+
+    for i, task in enumerate(queue, start=1):
+        key = checkpoint_key(task.model_id, task.condition_id, task.question_id)
+        if key in completed:
             continue
 
-        prompt = build_prompt(question)
+        client = clients[task.model_id]
+        prompt = build_prompt(task.question)
         response = client.complete(prompt)
-        parsed = parse_answer(response, question.label_style) if response else None
-        is_correct = parsed == question.correct_answer_index if parsed is not None else None
+        parsed = (
+            parse_answer(response, task.question.label_style) if response else None
+        )
+        is_correct = (
+            parsed == task.question.correct_answer_index
+            if parsed is not None
+            else None
+        )
 
         record = EvalRecord(
-            question_id=question.original_id,
-            subject=question.subject,
-            condition_id=question.condition_id,
-            perturbation_type=question.perturbation_type,
-            perturbation_params=question.perturbation_params,
-            model_id=client.model_id,
+            question_id=task.question_id,
+            subject=task.question.subject,
+            condition_id=task.condition_id,
+            perturbation_type=task.question.perturbation_type,
+            perturbation_params=task.question.perturbation_params,
+            model_id=task.model_id,
             model_response=response,
             parsed_answer=parsed,
             is_correct=is_correct,
-            original_correct_answer=question.correct_answer_index,
+            original_correct_answer=task.question.correct_answer_index,
             seed=seed,
         )
         append_jsonl(results_path, record)
-        completed.add(question.original_id)
+        completed.add(key)
         _save_checkpoint(checkpoint_path, completed, seed)
+
+        if i % 25 == 0 or i == total:
+            logger.info("Evaluation progress: %s / %s tasks", len(completed), total)
 
     return results_path
 

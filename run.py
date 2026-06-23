@@ -11,10 +11,15 @@ from pathlib import Path
 import numpy as np
 
 from src.conditions import normalize_condition, parse_conditions_arg
-from src.evaluator import build_model_client, evaluate
+from src.evaluator import run_evaluation
 from src.io_utils import atomic_write_json, load_config
 from src.loader import load_or_sample
 from src.metrics import compute_metrics, export_metrics
+from src.paraphrase_cache import (
+    collect_paraphrase_targets,
+    conditions_need_paraphrase,
+    warm_paraphrase_cache,
+)
 from src.perturbations import generate_perturbed_sets
 from src.viz import generate_all_figures
 
@@ -118,6 +123,7 @@ def main(argv: list[str] | None = None) -> int:
     metrics_dir = Path(config.paths.metrics_dir)
     _write_run_meta(metrics_dir, seed, sample_size, model_ids, condition_ids)
 
+    # 1. Load once
     logger.info("Loading or sampling %s MMLU questions (seed=%s)", sample_size, seed)
     sampled = load_or_sample(
         config.paths.sampled,
@@ -127,30 +133,31 @@ def main(argv: list[str] | None = None) -> int:
     )
     logger.info("Using %s sampled questions", len(sampled))
 
-    logger.info("Generating perturbed question sets for %s conditions", len(conditions))
+    # 2. Warm paraphrase cache upfront (before perturbation pipelines or eval)
+    if conditions_need_paraphrase(conditions):
+        targets = collect_paraphrase_targets(sampled, conditions, seed)
+        logger.info("Warming paraphrase cache for %s unique texts", len(targets))
+        warm_paraphrase_cache(targets, config)
+    else:
+        logger.info("No semantic_paraphrase conditions; skipping paraphrase cache warm")
+
+    # 3. Fan out to independent perturbation pipelines (one JSONL each)
+    logger.info("Running %s perturbation pipelines", len(conditions))
     perturbed_paths = generate_perturbed_sets(sampled, conditions, config)
 
+    # 4. Single evaluation loop with question-level checkpoint
     if not args.skip_eval:
-        raw_dir = Path(config.paths.raw_results_dir)
-        checkpoint_dir = raw_dir / "checkpoints"
-        for model in models:
-            client = build_model_client(model)
-            for condition_id, condition_path in perturbed_paths.items():
-                logger.info(
-                    "Evaluating model=%s condition=%s",
-                    model.id,
-                    condition_id,
-                )
-                evaluate(
-                    client=client,
-                    condition_path=condition_path,
-                    raw_results_dir=raw_dir,
-                    checkpoint_dir=checkpoint_dir,
-                    seed=seed,
-                )
+        logger.info("Starting unified evaluation loop")
+        run_evaluation(
+            models=models,
+            perturbed_paths=perturbed_paths,
+            raw_results_dir=Path(config.paths.raw_results_dir),
+            seed=seed,
+        )
     else:
         logger.info("Skipping evaluation")
 
+    # 5. Metrics over full results JSONL
     if not args.skip_metrics:
         logger.info("Computing metrics")
         metrics = compute_metrics(config.paths.raw_results_dir, seed=seed)
@@ -160,6 +167,7 @@ def main(argv: list[str] | None = None) -> int:
         logger.info("Skipping metrics")
         metrics = compute_metrics(config.paths.raw_results_dir, seed=seed)
 
+    # 6. Visualization as final pass over metrics
     if not args.skip_viz:
         logger.info("Generating figures")
         figure_paths = generate_all_figures(metrics, config.paths.figures_dir)
