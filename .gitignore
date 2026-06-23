@@ -216,3 +216,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Generated data and results
+data/sampled.jsonl
+data/perturbed/
+data/cache/
+results/

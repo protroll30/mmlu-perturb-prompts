@@ -1,0 +1,23 @@
+seed: 42
+sample_size: 300
+paths:
+  sampled: data/sampled.jsonl
+  perturbed_dir: data/perturbed
+  paraphrase_cache_dir: data/cache/paraphrase
+  raw_results_dir: results/raw
+  metrics_dir: results/metrics
+  figures_dir: results/figures
+
+models:
+  - id: model_a
+    base_url: https://api.openai.com/v1
+    model: gpt-4o-mini
+    api_key_env: OPENAI_API_KEY
+  - id: model_b
+    base_url: https://api.openai.com/v1
+    model: gpt-4o
+    api_key_env: OPENAI_API_KEY
+
+paraphrase:
+  model: claude-sonnet-4-6
+  api_key_env: ANTHROPIC_API_KEY
