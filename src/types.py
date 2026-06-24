@@ -39,9 +39,11 @@ class EvalRecord:
 @dataclass(frozen=True)
 class ModelConfig:
     id: str
-    base_url: str
     model: str
     api_key_env: str
+    provider: str = "openai"
+    base_url: str = ""
+    min_request_interval_seconds: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -67,6 +69,8 @@ class AppConfig:
     paths: PathsConfig
     models: list[ModelConfig]
     paraphrase: ParaphraseConfig
+    eval_concurrency: int = 1
+    min_questions_per_subject: int = 5
 
 
 @dataclass(frozen=True)

@@ -8,15 +8,12 @@ import numpy as np
 import pandas as pd
 
 
-def _macro_accuracy_pivot(accuracy_records: list[dict[str, Any]]) -> pd.DataFrame:
-    if not accuracy_records:
+def _macro_accuracy_pivot(metrics: dict[str, Any]) -> pd.DataFrame:
+    records = metrics.get("macro_accuracy_by_model_condition", [])
+    if not records:
         return pd.DataFrame()
-    df = pd.DataFrame(accuracy_records)
-    macro = (
-        df.groupby(["model_id", "condition_id"], as_index=False)
-        .agg(macro_accuracy=("accuracy", "mean"))
-    )
-    pivot = macro.pivot(
+    df = pd.DataFrame(records)
+    pivot = df.pivot(
         index="model_id",
         columns="condition_id",
         values="macro_accuracy",
@@ -31,7 +28,7 @@ def plot_accuracy_heatmap(
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    pivot = _macro_accuracy_pivot(metrics.get("accuracy_by_model_condition_subject", []))
+    pivot = _macro_accuracy_pivot(metrics)
     fig, ax = plt.subplots(figsize=(max(8, pivot.shape[1] * 0.8), max(4, pivot.shape[0] * 0.6)))
 
     if pivot.empty:
@@ -101,25 +98,31 @@ def plot_accuracy_scatter(
     figures_dir = Path(figures_dir)
     figures_dir.mkdir(parents=True, exist_ok=True)
 
-    accuracy_records = metrics.get("accuracy_by_model_condition_subject", [])
-    if not accuracy_records:
+    macro_records = metrics.get("accuracy_delta", [])
+    if not macro_records:
         return []
 
-    df = pd.DataFrame(accuracy_records)
-    perturbed_conditions = sorted(
-        c for c in df["condition_id"].unique() if c != original_condition
-    )
+    delta_df = pd.DataFrame(macro_records)
+    perturbed_conditions = sorted(delta_df["condition_id"].unique())
 
     output_paths: list[Path] = []
     for condition_id in perturbed_conditions:
-        perturbation_type = _perturbation_type_for_condition(df, condition_id)
-        orig = df[df["condition_id"] == original_condition][
-            ["model_id", "subject", "accuracy"]
-        ].rename(columns={"accuracy": "original_accuracy"})
-        pert = df[df["condition_id"] == condition_id][
-            ["model_id", "subject", "accuracy"]
-        ].rename(columns={"accuracy": "perturbed_accuracy"})
-        merged = orig.merge(pert, on=["model_id", "subject"], how="inner")
+        perturbation_type = _perturbation_type_for_condition(
+            pd.DataFrame(metrics.get("accuracy_by_model_condition_subject", [])),
+            condition_id,
+        )
+        merged = delta_df[delta_df["condition_id"] == condition_id][
+            [
+                "model_id",
+                "original_macro_accuracy",
+                "perturbed_macro_accuracy",
+            ]
+        ].rename(
+            columns={
+                "original_macro_accuracy": "original_accuracy",
+                "perturbed_macro_accuracy": "perturbed_accuracy",
+            }
+        )
 
         fig, ax = plt.subplots(figsize=(7, 7))
         if merged.empty:
@@ -129,17 +132,28 @@ def plot_accuracy_scatter(
             ax.scatter(
                 merged["original_accuracy"],
                 merged["perturbed_accuracy"],
-                alpha=0.7,
+                alpha=0.9,
+                s=80,
             )
+            for _, row in merged.iterrows():
+                ax.annotate(
+                    row["model_id"],
+                    (row["original_accuracy"], row["perturbed_accuracy"]),
+                    textcoords="offset points",
+                    xytext=(4, 4),
+                    fontsize=8,
+                )
             lims = [
                 np.min([merged["original_accuracy"].min(), merged["perturbed_accuracy"].min()]),
                 np.max([merged["original_accuracy"].max(), merged["perturbed_accuracy"].max()]),
             ]
+            pad = max(0.05, (lims[1] - lims[0]) * 0.1)
+            lims = [lims[0] - pad, lims[1] + pad]
             ax.plot(lims, lims, "k--", alpha=0.5, linewidth=1)
             ax.set_xlim(lims)
             ax.set_ylim(lims)
-            ax.set_xlabel("Original accuracy")
-            ax.set_ylabel("Perturbed accuracy")
+            ax.set_xlabel("Original macro accuracy (matched set)")
+            ax.set_ylabel("Perturbed macro accuracy (matched set)")
             ax.set_title(f"{perturbation_type} ({condition_id})")
 
         safe_name = condition_id.replace("/", "_").replace("+", "_")

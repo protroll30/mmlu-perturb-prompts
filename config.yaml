@@ -1,5 +1,7 @@
 seed: 42
 sample_size: 300
+eval_concurrency: 8
+min_questions_per_subject: 5
 paths:
   sampled: data/sampled.jsonl
   perturbed_dir: data/perturbed
@@ -8,16 +10,26 @@ paths:
   metrics_dir: results/metrics
   figures_dir: results/figures
 
+# Three models from distinct training pipelines (required for meaningful Spearman).
 models:
-  - id: model_a
+  - id: gpt-4o-mini
+    provider: openai
     base_url: https://api.openai.com/v1
     model: gpt-4o-mini
     api_key_env: OPENAI_API_KEY
-  - id: model_b
-    base_url: https://api.openai.com/v1
-    model: gpt-4o
-    api_key_env: OPENAI_API_KEY
+
+  - id: claude-haiku-4-5
+    provider: anthropic
+    model: claude-haiku-4-5-20251001
+    api_key_env: ANTHROPIC_API_KEY
+
+  - id: llama-3-8b
+    provider: openai
+    base_url: https://api.groq.com/openai/v1
+    model: llama-3.1-8b-instant
+    api_key_env: GROQ_API_KEY
+    min_request_interval_seconds: 2.1  # Groq free tier: 30 RPM
 
 paraphrase:
-  model: claude-sonnet-4-6
+  model: claude-haiku-4-5-20251001
   api_key_env: ANTHROPIC_API_KEY

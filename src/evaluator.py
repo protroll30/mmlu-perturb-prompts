@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import logging
+import random
 import re
+import threading
 import time
-from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import httpx
@@ -32,10 +35,12 @@ INSTRUCTION_PREFIXES = {
 }
 
 ANSWER_SUFFIXES = {
-    "none": "",
-    "minimal": "Answer:",
-    "verbose": "Answer:",
+    "none": "Reply with only the option label (e.g. A), nothing else.",
+    "minimal": "Reply with only the option label (e.g. A), nothing else.",
+    "verbose": "Reply with only the option label (e.g. A), nothing else.",
 }
+
+MAX_TASK_ATTEMPTS = 5
 
 
 @dataclass(frozen=True)
@@ -46,14 +51,59 @@ class EvalTask:
     question: PerturbedQuestion
 
 
-@dataclass(frozen=True)
+@dataclass
 class ModelClient:
     model_id: str
+    provider: str
     base_url: str
     model: str
     api_key: str
+    min_request_interval_seconds: float = 0.0
+    _rate_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+    _last_request_at: float = field(default=0.0, init=False, repr=False)
+
+    def _throttle(self) -> None:
+        if self.min_request_interval_seconds <= 0:
+            return
+        with self._rate_lock:
+            now = time.monotonic()
+            wait = self.min_request_interval_seconds - (now - self._last_request_at)
+            if wait > 0:
+                time.sleep(wait)
+            self._last_request_at = time.monotonic()
+
+    def _retry_wait(self, exc: Exception, attempt: int) -> None:
+        if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 429:
+            time.sleep(max(3.0, 2**attempt))
+            return
+        if attempt < 2:
+            time.sleep(2**attempt)
 
     def complete(self, prompt: str) -> str | None:
+        self._throttle()
+        if self.provider == "anthropic":
+            return self._complete_anthropic(prompt)
+        return self._complete_openai(prompt)
+
+    def _should_retry(self, exc: Exception) -> bool:
+        if isinstance(exc, httpx.HTTPStatusError):
+            status = exc.response.status_code
+            return status == 429 or status >= 500
+        status = getattr(exc, "status_code", None)
+        if isinstance(status, int):
+            return status == 429 or status >= 500
+        return True
+
+    def _format_error(self, exc: Exception) -> str:
+        if isinstance(exc, httpx.HTTPStatusError):
+            try:
+                body = exc.response.json()
+            except Exception:  # noqa: BLE001
+                body = exc.response.text
+            return f"{exc} body={body}"
+        return str(exc)
+
+    def _complete_openai(self, prompt: str) -> str | None:
         url = f"{self.base_url.rstrip('/')}/chat/completions"
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -76,17 +126,58 @@ class ModelClient:
                 return str(data["choices"][0]["message"]["content"]).strip()
             except Exception as exc:  # noqa: BLE001
                 last_error = exc
-                wait = 2**attempt
                 logger.warning(
                     "Model %s attempt %s failed: %s",
                     self.model_id,
                     attempt + 1,
-                    exc,
+                    self._format_error(exc),
                 )
-                if attempt < 2:
-                    time.sleep(wait)
+                if attempt < 2 and self._should_retry(exc):
+                    self._retry_wait(exc, attempt)
+                elif not self._should_retry(exc):
+                    break
 
-        logger.error("Model %s failed after retries: %s", self.model_id, last_error)
+        logger.error(
+            "Model %s failed after retries: %s",
+            self.model_id,
+            self._format_error(last_error) if last_error else "unknown",
+        )
+        return None
+
+    def _complete_anthropic(self, prompt: str) -> str | None:
+        import anthropic
+
+        last_error: Exception | None = None
+        for attempt in range(3):
+            try:
+                client = anthropic.Anthropic(api_key=self.api_key)
+                response = client.messages.create(
+                    model=self.model,
+                    max_tokens=16,
+                    temperature=0.0,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                return "".join(
+                    block.text for block in response.content if block.type == "text"
+                ).strip()
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                logger.warning(
+                    "Model %s attempt %s failed: %s",
+                    self.model_id,
+                    attempt + 1,
+                    self._format_error(exc),
+                )
+                if attempt < 2 and self._should_retry(exc):
+                    self._retry_wait(exc, attempt)
+                elif not self._should_retry(exc):
+                    break
+
+        logger.error(
+            "Model %s failed after retries: %s",
+            self.model_id,
+            self._format_error(last_error) if last_error else "unknown",
+        )
         return None
 
 
@@ -128,6 +219,8 @@ _LEADING_PATTERNS = [
 ]
 
 _FALLBACK_PATTERNS = [
+    re.compile(r"(?:answer|option|choice)(?:\s+is)?\s*:?\s*\(?([A-Da-d1-4])\)?", re.IGNORECASE),
+    re.compile(r"\b(?:choice|option)\s+([A-Da-d1-4])\b", re.IGNORECASE),
     re.compile(r"\b([A-Da-d])\b"),
     re.compile(r"\b([1-4])\b"),
     re.compile(r"\(([a-d])\)", re.IGNORECASE),
@@ -172,6 +265,12 @@ def parse_answer(response: str, label_style: str = "alpha_upper") -> int | None:
             if idx is not None:
                 return idx
 
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if lines:
+        idx = _index_from_token(lines[-1], label_style)
+        if idx is not None:
+            return idx
+
     return None
 
 
@@ -192,6 +291,35 @@ def _load_checkpoint(path: Path) -> set[str]:
         return set()
     data = read_json(path)
     return set(data.get("completed_keys", []))
+
+
+def _load_valid_completed_keys(checkpoint_path: Path, results_path: Path) -> set[str]:
+    """Checkpoint keys count only when a parseable answer exists in results."""
+    checkpointed = _load_checkpoint(checkpoint_path)
+    if not results_path.exists():
+        return set()
+
+    from src.io_utils import read_jsonl
+
+    valid_keys: set[str] = set()
+    for record in read_jsonl(results_path):
+        if record.get("parsed_answer") is None:
+            continue
+        valid_keys.add(
+            checkpoint_key(
+                str(record["model_id"]),
+                str(record["condition_id"]),
+                str(record["question_id"]),
+            )
+        )
+
+    scrubbed = checkpointed & valid_keys
+    if scrubbed != checkpointed:
+        logger.info(
+            "Scrubbed %s checkpoint keys lacking a parseable answer",
+            len(checkpointed) - len(scrubbed),
+        )
+    return scrubbed
 
 
 def _save_checkpoint(path: Path, completed_keys: set[str], seed: int) -> None:
@@ -248,41 +376,90 @@ def run_evaluation(
     perturbed_paths: dict[str, Path],
     raw_results_dir: Path,
     seed: int,
+    concurrency: int = 1,
 ) -> Path:
-    """Single evaluation loop: question → condition → model, with question-level checkpoint."""
+    """Evaluate pending tasks with optional parallel API calls (checkpoint-safe)."""
+    if concurrency < 1:
+        raise ValueError("concurrency must be at least 1")
+
     raw_results_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path = _checkpoint_path(raw_results_dir)
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     results_path = _results_path(raw_results_dir)
 
     clients = {m.id: build_model_client(m) for m in models}
-    completed = _load_checkpoint(checkpoint_path)
+    completed = _load_valid_completed_keys(checkpoint_path, results_path)
+    if completed != _load_checkpoint(checkpoint_path):
+        _save_checkpoint(checkpoint_path, completed, seed)
     queue = _build_eval_queue(models, perturbed_paths)
 
     total = len(queue)
     done_before = len(completed)
+    pending = [
+        task
+        for task in queue
+        if checkpoint_key(task.model_id, task.condition_id, task.question_id)
+        not in completed
+    ]
+    rng = random.Random(seed)
+    rng.shuffle(pending)
+
     logger.info(
-        "Evaluation queue: %s tasks (%s already checkpointed)",
+        "Evaluation queue: %s tasks (%s done, %s pending), concurrency=%s",
         total,
         done_before,
+        len(pending),
+        concurrency,
     )
 
-    for i, task in enumerate(queue, start=1):
+    if not pending:
+        return results_path
+
+    lock = threading.Lock()
+    pending_total = len(pending)
+    completed_this_run = 0
+
+    def process_task(task: EvalTask) -> None:
+        nonlocal completed_this_run
         key = checkpoint_key(task.model_id, task.condition_id, task.question_id)
-        if key in completed:
-            continue
+
+        with lock:
+            if key in completed:
+                return
 
         client = clients[task.model_id]
         prompt = build_prompt(task.question)
-        response = client.complete(prompt)
-        parsed = (
-            parse_answer(response, task.question.label_style) if response else None
-        )
-        is_correct = (
-            parsed == task.question.correct_answer_index
-            if parsed is not None
-            else None
-        )
+        response: str | None = None
+        parsed: int | None = None
+        for attempt in range(MAX_TASK_ATTEMPTS):
+            response = client.complete(prompt)
+            if response is None:
+                logger.warning(
+                    "API failure for %s (attempt %s/%s); retrying",
+                    key,
+                    attempt + 1,
+                    MAX_TASK_ATTEMPTS,
+                )
+                continue
+            parsed = parse_answer(response, task.question.label_style)
+            if parsed is not None:
+                break
+            logger.warning(
+                "Unparseable response for %s (attempt %s/%s); retrying",
+                key,
+                attempt + 1,
+                MAX_TASK_ATTEMPTS,
+            )
+
+        if response is None or parsed is None:
+            logger.warning(
+                "Incomplete cell %s after %s attempts; not checkpointing",
+                key,
+                MAX_TASK_ATTEMPTS,
+            )
+            return
+
+        is_correct = parsed == task.question.correct_answer_index
 
         record = EvalRecord(
             question_id=task.question_id,
@@ -297,12 +474,47 @@ def run_evaluation(
             original_correct_answer=task.question.correct_answer_index,
             seed=seed,
         )
-        append_jsonl(results_path, record)
-        completed.add(key)
-        _save_checkpoint(checkpoint_path, completed, seed)
 
-        if i % 25 == 0 or i == total:
-            logger.info("Evaluation progress: %s / %s tasks", len(completed), total)
+        with lock:
+            if key in completed:
+                return
+            append_jsonl(results_path, record)
+            completed.add(key)
+            _save_checkpoint(checkpoint_path, completed, seed)
+            completed_this_run += 1
+            if completed_this_run % 25 == 0 or completed_this_run == pending_total:
+                logger.info(
+                    "Evaluation progress: %s / %s pending (%s total checkpointed / %s)",
+                    completed_this_run,
+                    pending_total,
+                    len(completed),
+                    total,
+                )
+
+    if concurrency == 1:
+        for task in pending:
+            process_task(task)
+    else:
+        with ThreadPoolExecutor(max_workers=concurrency) as executor:
+            futures = [executor.submit(process_task, task) for task in pending]
+            for future in as_completed(futures):
+                future.result()
+
+    still_pending = [
+        task
+        for task in queue
+        if checkpoint_key(task.model_id, task.condition_id, task.question_id)
+        not in completed
+    ]
+    if still_pending:
+        logger.error(
+            "Evaluation incomplete: %s / %s cells missing parseable answers. "
+            "Re-run to retry remaining tasks.",
+            len(still_pending),
+            total,
+        )
+    else:
+        logger.info("Evaluation complete: all %s cells filled", total)
 
     return results_path
 
@@ -312,7 +524,9 @@ def build_model_client(model: ModelConfig) -> ModelClient:
 
     return ModelClient(
         model_id=model.id,
+        provider=model.provider,
         base_url=model.base_url,
         model=model.model,
         api_key=get_env_api_key(model.api_key_env),
+        min_request_interval_seconds=model.min_request_interval_seconds,
     )

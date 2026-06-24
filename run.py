@@ -12,7 +12,7 @@ import numpy as np
 
 from src.conditions import normalize_condition, parse_conditions_arg
 from src.evaluator import run_evaluation
-from src.io_utils import atomic_write_json, load_config
+from src.io_utils import atomic_write_json, load_config, load_dotenv_file, validate_api_keys
 from src.loader import load_or_sample
 from src.metrics import compute_metrics, export_metrics
 from src.paraphrase_cache import (
@@ -100,12 +100,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="Re-sample MMLU questions even if sampled.jsonl exists",
     )
     parser.add_argument("--skip-eval", action="store_true", help="Skip model evaluation")
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=None,
+        help="Parallel eval API calls (default: eval_concurrency in config.yaml)",
+    )
     parser.add_argument("--skip-metrics", action="store_true", help="Skip metrics export")
     parser.add_argument("--skip-viz", action="store_true", help="Skip figure generation")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
+    load_dotenv_file()
+
     parser = build_parser()
     args = parser.parse_args(argv)
 
@@ -119,6 +127,14 @@ def main(argv: list[str] | None = None) -> int:
 
     condition_ids = [c.condition_id for c in conditions]
     model_ids = [m.id for m in models]
+
+    validate_api_keys(
+        config,
+        models,
+        need_paraphrase=conditions_need_paraphrase(conditions),
+        need_eval=not args.skip_eval,
+    )
+    logger.info("API key validation passed")
 
     metrics_dir = Path(config.paths.metrics_dir)
     _write_run_meta(metrics_dir, seed, sample_size, model_ids, condition_ids)
@@ -153,6 +169,11 @@ def main(argv: list[str] | None = None) -> int:
             perturbed_paths=perturbed_paths,
             raw_results_dir=Path(config.paths.raw_results_dir),
             seed=seed,
+            concurrency=(
+                args.concurrency
+                if args.concurrency is not None
+                else config.eval_concurrency
+            ),
         )
     else:
         logger.info("Skipping evaluation")
@@ -160,12 +181,22 @@ def main(argv: list[str] | None = None) -> int:
     # 5. Metrics over full results JSONL
     if not args.skip_metrics:
         logger.info("Computing metrics")
-        metrics = compute_metrics(config.paths.raw_results_dir, seed=seed)
+        metrics = compute_metrics(
+            config.paths.raw_results_dir,
+            seed=seed,
+            model_ids=model_ids,
+            min_questions_per_subject=config.min_questions_per_subject,
+        )
         summary_path, metrics_path = export_metrics(metrics, config.paths.metrics_dir)
         logger.info("Wrote metrics to %s and %s", summary_path, metrics_path)
     else:
         logger.info("Skipping metrics")
-        metrics = compute_metrics(config.paths.raw_results_dir, seed=seed)
+        metrics = compute_metrics(
+            config.paths.raw_results_dir,
+            seed=seed,
+            model_ids=model_ids,
+            min_questions_per_subject=config.min_questions_per_subject,
+        )
 
     # 6. Visualization as final pass over metrics
     if not args.skip_viz:
