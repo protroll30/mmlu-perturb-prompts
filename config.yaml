@@ -23,12 +23,12 @@ models:
     model: claude-haiku-4-5-20251001
     api_key_env: ANTHROPIC_API_KEY
 
-  - id: llama-3-8b
+  - id: gemini-flash
     provider: openai
-    base_url: https://api.groq.com/openai/v1
-    model: llama-3.1-8b-instant
-    api_key_env: GROQ_API_KEY
-    min_request_interval_seconds: 2.1  # Groq free tier: 30 RPM
+    base_url: https://generativelanguage.googleapis.com/v1beta/openai/
+    model: gemini-2.5-flash-lite
+    api_key_env: GEMINI_API_KEY
+    min_request_interval_seconds: 4.5  # free tier ~15 RPM; use 12.5 for gemini-2.5-flash (5 RPM)
 
 paraphrase:
   model: claude-haiku-4-5-20251001

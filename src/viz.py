@@ -80,6 +80,95 @@ def plot_flip_rate_by_subject(
     return output_path
 
 
+def plot_flip_rate_by_perturbation_type(
+    metrics: dict[str, Any],
+    output_path: str | Path,
+) -> Path:
+    """Bar chart of pooled flip rate per perturbation type, sorted descending."""
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    by_type = metrics.get("flip_rates", {}).get("by_perturbation_type", {})
+    if not by_type:
+        fig, ax = plt.subplots(figsize=(8, 5))
+        ax.text(0.5, 0.5, "No flip rate data", ha="center", va="center")
+        ax.axis("off")
+        fig.tight_layout()
+        fig.savefig(output_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        return output_path
+
+    sorted_items = sorted(by_type.items(), key=lambda kv: kv[1], reverse=True)
+    labels = [kv[0] for kv in sorted_items]
+    values = [kv[1] for kv in sorted_items]
+
+    fig, ax = plt.subplots(figsize=(max(6, len(labels) * 1.2), 5))
+    bars = ax.bar(labels, values, color="steelblue")
+    ax.bar_label(bars, fmt="{:.1%}", padding=3, fontsize=9)
+    ax.set_xlabel("Perturbation type")
+    ax.set_ylabel("Pooled flip rate (matched set)")
+    ax.set_title("Answer flip rate by perturbation type")
+    ax.set_ylim(0, min(1.0, max(values) * 1.25))
+    plt.setp(ax.get_xticklabels(), rotation=20, ha="right")
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return output_path
+
+
+def plot_flip_rate_by_model_perturbation_type(
+    metrics: dict[str, Any],
+    output_path: str | Path,
+) -> Path:
+    """Grouped bar chart of flip rate per perturbation type, one bar per model."""
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    by_model_type: dict[str, dict[str, float]] = metrics.get(
+        "flip_rates", {}
+    ).get("by_model_perturbation_type", {})
+    model_ids = sorted(by_model_type.keys())
+    all_types = sorted(
+        {ptype for m in by_model_type.values() for ptype in m},
+        key=lambda t: -np.mean(
+            [by_model_type[m].get(t, 0.0) for m in model_ids]
+        ),
+    )
+
+    if not model_ids or not all_types:
+        fig, ax = plt.subplots(figsize=(8, 5))
+        ax.text(0.5, 0.5, "No flip rate data", ha="center", va="center")
+        ax.axis("off")
+        fig.tight_layout()
+        fig.savefig(output_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        return output_path
+
+    x = np.arange(len(all_types))
+    width = 0.8 / max(len(model_ids), 1)
+    fig, ax = plt.subplots(figsize=(max(8, len(all_types) * 1.4), 5))
+
+    for i, model_id in enumerate(model_ids):
+        vals = [by_model_type[model_id].get(t, float("nan")) for t in all_types]
+        offset = (i - (len(model_ids) - 1) / 2) * width
+        bars = ax.bar(x + offset, vals, width, label=model_id, alpha=0.85)
+        ax.bar_label(bars, fmt="{:.0%}", padding=2, fontsize=7)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(all_types, rotation=20, ha="right")
+    ax.set_xlabel("Perturbation type")
+    ax.set_ylabel("Flip rate (matched set)")
+    ax.set_title("Per-model flip rate by perturbation type")
+    ax.set_ylim(0, 1.0)
+    ax.legend(title="Model", loc="upper right", fontsize=8)
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return output_path
+
+
 def _perturbation_type_for_condition(
     accuracy_df: pd.DataFrame,
     condition_id: str,
@@ -174,6 +263,12 @@ def generate_all_figures(
     paths = [
         plot_accuracy_heatmap(metrics, figures_dir / "accuracy_heatmap.png"),
         plot_flip_rate_by_subject(metrics, figures_dir / "flip_rate_by_subject.png"),
+        plot_flip_rate_by_perturbation_type(
+            metrics, figures_dir / "flip_rate_by_perturbation_type.png"
+        ),
+        plot_flip_rate_by_model_perturbation_type(
+            metrics, figures_dir / "flip_rate_by_model_perturbation_type.png"
+        ),
     ]
     paths.extend(plot_accuracy_scatter(metrics, figures_dir))
     return paths

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import json
 import logging
 import random
 import re
 import threading
 import time
+from typing import Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -41,6 +43,64 @@ ANSWER_SUFFIXES = {
 }
 
 MAX_TASK_ATTEMPTS = 5
+_RETRY_IN_MESSAGE_RE = re.compile(r"retry in (\d+(?:\.\d+)?)s", re.IGNORECASE)
+
+
+def _parse_duration_seconds(value: str) -> float | None:
+    text = value.strip()
+    if text.endswith("s"):
+        try:
+            return float(text[:-1])
+        except ValueError:
+            return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def _parse_retry_seconds(exc: Exception) -> float | None:
+    if not isinstance(exc, httpx.HTTPStatusError) or exc.response.status_code != 429:
+        return None
+
+    retry_after = exc.response.headers.get("retry-after")
+    if retry_after:
+        try:
+            return float(retry_after)
+        except ValueError:
+            pass
+
+    try:
+        payload = exc.response.json()
+    except Exception:  # noqa: BLE001
+        payload = None
+
+    if payload is None:
+        return None
+
+    bodies: list[Any] = [payload]
+    if isinstance(payload, list):
+        bodies = payload
+
+    for body in bodies:
+        if not isinstance(body, dict):
+            continue
+        error = body.get("error", body)
+        if isinstance(error, dict):
+            message = str(error.get("message", ""))
+            match = _RETRY_IN_MESSAGE_RE.search(message)
+            if match:
+                return float(match.group(1))
+            for detail in error.get("details", []):
+                if not isinstance(detail, dict):
+                    continue
+                retry_delay = detail.get("retryDelay")
+                if retry_delay is not None:
+                    parsed = _parse_duration_seconds(str(retry_delay))
+                    if parsed is not None:
+                        return parsed
+
+    return None
 
 
 @dataclass(frozen=True)
@@ -73,8 +133,18 @@ class ModelClient:
             self._last_request_at = time.monotonic()
 
     def _retry_wait(self, exc: Exception, attempt: int) -> None:
+        delay = _parse_retry_seconds(exc)
+        if delay is not None:
+            sleep_for = delay + 0.5
+            logger.info(
+                "Model %s rate limited; sleeping %.1fs",
+                self.model_id,
+                sleep_for,
+            )
+            time.sleep(sleep_for)
+            return
         if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 429:
-            time.sleep(max(3.0, 2**attempt))
+            time.sleep(max(10.0, 2**attempt))
             return
         if attempt < 2:
             time.sleep(2**attempt)
@@ -117,7 +187,7 @@ class ModelClient:
         }
 
         last_error: Exception | None = None
-        for attempt in range(3):
+        for attempt in range(5):
             try:
                 with httpx.Client(timeout=60.0) as client:
                     response = client.post(url, headers=headers, json=payload)
@@ -132,7 +202,7 @@ class ModelClient:
                     attempt + 1,
                     self._format_error(exc),
                 )
-                if attempt < 2 and self._should_retry(exc):
+                if attempt < 4 and self._should_retry(exc):
                     self._retry_wait(exc, attempt)
                 elif not self._should_retry(exc):
                     break
@@ -377,8 +447,13 @@ def run_evaluation(
     raw_results_dir: Path,
     seed: int,
     concurrency: int = 1,
-) -> Path:
-    """Evaluate pending tasks with optional parallel API calls (checkpoint-safe)."""
+) -> tuple[Path, bool]:
+    """Evaluate pending tasks with optional parallel API calls (checkpoint-safe).
+
+    Returns (results_path, is_complete). is_complete is True only when every
+    (model, condition, question) cell has a parseable answer. If False, re-run
+    to retry remaining cells — the checkpoint prevents redundant API calls.
+    """
     if concurrency < 1:
         raise ValueError("concurrency must be at least 1")
 
@@ -413,7 +488,7 @@ def run_evaluation(
     )
 
     if not pending:
-        return results_path
+        return results_path, True
 
     lock = threading.Lock()
     pending_total = len(pending)
@@ -506,17 +581,23 @@ def run_evaluation(
         if checkpoint_key(task.model_id, task.condition_id, task.question_id)
         not in completed
     ]
-    if still_pending:
+    is_complete = len(still_pending) == 0
+    if not is_complete:
         logger.error(
             "Evaluation incomplete: %s / %s cells missing parseable answers. "
             "Re-run to retry remaining tasks.",
             len(still_pending),
             total,
         )
+        by_condition: dict[str, int] = {}
+        for task in still_pending:
+            by_condition[task.condition_id] = by_condition.get(task.condition_id, 0) + 1
+        for cond_id, cnt in sorted(by_condition.items()):
+            logger.error("  Missing %s cells for condition '%s'", cnt, cond_id)
     else:
         logger.info("Evaluation complete: all %s cells filled", total)
 
-    return results_path
+    return results_path, is_complete
 
 
 def build_model_client(model: ModelConfig) -> ModelClient:

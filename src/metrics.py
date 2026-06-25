@@ -219,6 +219,7 @@ def _flip_rates(
         "by_subject": {},
         "by_condition": {},
         "by_perturbation_type": {},
+        "by_model_perturbation_type": {},
     }
     if matched_df.empty or "parsed_answer" not in matched_df.columns:
         return empty
@@ -269,11 +270,22 @@ def _flip_rates(
         .to_dict()
     )
 
+    by_model_perturbation_type: dict[str, dict[str, float]] = {}
+    grouped = (
+        valid.groupby(["model_id", "perturbation_type"], as_index=False)
+        .agg(flip_rate=("flipped", "mean"))
+    )
+    for _, row in grouped.iterrows():
+        by_model_perturbation_type.setdefault(
+            str(row["model_id"]), {}
+        )[str(row["perturbation_type"])] = float(row["flip_rate"])
+
     return {
         "per_record": per_record,
         "by_subject": by_subject,
         "by_condition": by_condition,
         "by_perturbation_type": by_perturbation_type,
+        "by_model_perturbation_type": by_model_perturbation_type,
     }
 
 
@@ -486,12 +498,88 @@ def _flip_rates_from_records(flip_df: pd.DataFrame) -> dict[str, Any]:
         .set_index("perturbation_type")["flip_rate"]
         .to_dict()
     )
+
+    # Per-model breakdown: {model_id: {perturbation_type: flip_rate}}
+    by_model_perturbation_type: dict[str, dict[str, float]] = {}
+    if not flip_df.empty:
+        grouped = (
+            flip_df.groupby(["model_id", "perturbation_type"], as_index=False)
+            .agg(flip_rate=("flipped", "mean"))
+        )
+        for _, row in grouped.iterrows():
+            by_model_perturbation_type.setdefault(
+                str(row["model_id"]), {}
+            )[str(row["perturbation_type"])] = float(row["flip_rate"])
+
     return {
         "per_record": flip_df.to_dict(orient="records"),
         "by_subject": by_subject,
         "by_condition": by_condition,
         "by_perturbation_type": by_perturbation_type,
+        "by_model_perturbation_type": by_model_perturbation_type,
     }
+
+
+def _spearman_by_perturbation_type(
+    accuracy_df: pd.DataFrame,
+    condition_to_type: dict[str, str],
+    model_ids: list[str],
+    original_condition: str = "original",
+    min_questions_per_subject: int = 5,
+) -> dict[str, dict[str, Any]]:
+    """Spearman rank correlation per perturbation type, pooling (model, subject) pairs.
+
+    With only 3 models, condition-level Spearman has 3 data points. This function
+    pools across subjects within each perturbation type, giving ~N_models * N_subjects
+    data points for a more robust estimate. Subjects with fewer than
+    min_questions_per_subject questions are excluded.
+    """
+    if accuracy_df.empty:
+        return {}
+
+    orig_data = accuracy_df[
+        (accuracy_df["condition_id"] == original_condition)
+        & (accuracy_df["model_id"].isin(model_ids))
+        & (accuracy_df["n"] >= min_questions_per_subject)
+    ][["model_id", "subject", "accuracy"]].rename(columns={"accuracy": "accuracy_orig"})
+
+    perturbed_conditions = [
+        c for c in accuracy_df["condition_id"].unique() if c != original_condition
+    ]
+
+    # Group conditions by perturbation type
+    type_to_conditions: dict[str, list[str]] = {}
+    for cond in perturbed_conditions:
+        ptype = condition_to_type.get(cond, "unknown")
+        type_to_conditions.setdefault(ptype, []).append(cond)
+
+    results: dict[str, dict[str, Any]] = {}
+    for ptype, conds in sorted(type_to_conditions.items()):
+        x_vals: list[float] = []
+        y_vals: list[float] = []
+
+        for cond in conds:
+            pert_data = accuracy_df[
+                (accuracy_df["condition_id"] == cond)
+                & (accuracy_df["model_id"].isin(model_ids))
+                & (accuracy_df["n"] >= min_questions_per_subject)
+            ][["model_id", "subject", "accuracy"]].rename(
+                columns={"accuracy": "accuracy_pert"}
+            )
+
+            merged = orig_data.merge(pert_data, on=["model_id", "subject"])
+            if not merged.empty:
+                x_vals.extend(merged["accuracy_orig"].tolist())
+                y_vals.extend(merged["accuracy_pert"].tolist())
+
+        spearman = _safe_spearmanr(x_vals, y_vals, min_n=max(len(model_ids), 3))
+        results[ptype] = {
+            "spearman": spearman,
+            "n_pairs": len(x_vals),
+            "conditions": sorted(conds),
+        }
+
+    return results
 
 
 def _build_summary_csv(
@@ -599,6 +687,13 @@ def compute_metrics(
         original_condition,
         min_questions_per_subject,
     )
+    spearman_by_type = _spearman_by_perturbation_type(
+        accuracy_df,
+        condition_to_type,
+        resolved_model_ids,
+        original_condition,
+        min_questions_per_subject,
+    )
     deltas_df = _accuracy_deltas(macro_df, condition_to_type, original_condition)
     heatmap_macro_df = _heatmap_macro_table(macro_df, original_condition)
     summary_df = _build_summary_csv(
@@ -615,6 +710,7 @@ def compute_metrics(
             orient="records"
         ),
         "spearman_rank_correlation": spearman,
+        "spearman_by_perturbation_type": spearman_by_type,
         "flip_rates": flip_rates,
         "accuracy_delta": deltas_df.to_dict(orient="records"),
         "summary_table": summary_df.to_dict(orient="records"),

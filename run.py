@@ -162,9 +162,10 @@ def main(argv: list[str] | None = None) -> int:
     perturbed_paths = generate_perturbed_sets(sampled, conditions, config)
 
     # 4. Single evaluation loop with question-level checkpoint
+    eval_complete = True
     if not args.skip_eval:
         logger.info("Starting unified evaluation loop")
-        run_evaluation(
+        _, eval_complete = run_evaluation(
             models=models,
             perturbed_paths=perturbed_paths,
             raw_results_dir=Path(config.paths.raw_results_dir),
@@ -175,6 +176,11 @@ def main(argv: list[str] | None = None) -> int:
                 else config.eval_concurrency
             ),
         )
+        if not eval_complete:
+            logger.error(
+                "Run ended with missing cells. Re-run the same command to retry. "
+                "Metrics will be computed on the incomplete data."
+            )
     else:
         logger.info("Skipping evaluation")
 
@@ -207,7 +213,7 @@ def main(argv: list[str] | None = None) -> int:
     else:
         logger.info("Skipping visualization")
 
-    return 0
+    return 0 if eval_complete else 1
 
 
 if __name__ == "__main__":
