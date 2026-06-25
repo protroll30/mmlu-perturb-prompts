@@ -1,0 +1,20 @@
+{
+  "seed": 42,
+  "timestamp": "2026-06-24T20:42:31.429600+00:00",
+  "sample_size": 300,
+  "models": [
+    "gemini-flash"
+  ],
+  "conditions": [
+    "original",
+    "label_remap:numeric",
+    "label_remap:parenthetical",
+    "option_shuffle",
+    "context_inject",
+    "instruction_style:none",
+    "instruction_style:minimal",
+    "instruction_style:verbose",
+    "semantic_paraphrase"
+  ],
+  "git_hash": "ff0ab74e7e894196ef0e7abc91e74565a6fc99da"
+}
